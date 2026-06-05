@@ -1,0 +1,16 @@
+# Virtual environment
+.venv/
+
+# Runtime artifacts
+nohup.out
+
+# Python build / cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Editor / tool local settings
+.claude/settings.local.json
+.continue/
