@@ -27,6 +27,8 @@ DEFAULT_GAUGE_COLORS = {
 # ── Thresholds as % of full-scale (FUN-10) ────────────────────────────────────
 # All values in the range [0, 100] representing percentage of each gauge's
 # full-scale (max_val − min_val).  Defaults: 90 % warn / 98 % crit.
+# For system_memory, the default is stored as a percentage but applied as
+# absolute GB values at runtime (see app.py).
 DEFAULT_THRESHOLDS = {
     "temperature":   {"warn": 90, "crit": 98},
     "utilization":   {"warn": 90, "crit": 98},

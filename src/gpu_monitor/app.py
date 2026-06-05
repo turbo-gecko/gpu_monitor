@@ -9,7 +9,7 @@ from .config import (
     load_window_state, save_window_state, get_geometry_for_layout,
 )
 from .metrics import MetricsFetcher
-from .scaling import pct_to_abs, resolve_ranges
+from .scaling import pct_to_abs, resolve_ranges, DEFAULT_METRIC_RANGES
 from .ui_components import Gauge
 from .logger import log_threshold_breach
 
@@ -29,6 +29,9 @@ class GPUMonitorApp:
         self._thresholds_pct = self._state.get("thresholds",   DEFAULT_THRESHOLDS)
         self._gauge_colors   = self._state.get("gauge_colors", DEFAULT_GAUGE_COLORS)
         self._gauge_size     = self._state.get("gauge_size",   "normal")
+
+        # Detected total system memory in GB (used for system_memory gauge max)
+        self._total_memory_gb = None
 
         # Clamp interval (FUN-04)
         self.update_interval_ms = (
@@ -50,6 +53,13 @@ class GPUMonitorApp:
         limits = self.metrics.fetch_gpu_limits()
         self._metric_ranges = resolve_ranges(limits.get("power_max"),
                                              limits.get("temp_max"))
+
+        # Detect total system memory for the system_memory gauge max.
+        self._total_memory_gb = MetricsFetcher.fetch_total_memory_gb()
+        if self._total_memory_gb is not None and self._total_memory_gb > 0:
+            self._metric_ranges["system_memory"] = (0, self._total_memory_gb)
+        else:
+            self._metric_ranges["system_memory"] = DEFAULT_METRIC_RANGES["system_memory"]
 
         # Background metric fetches hand their results back to the Tk thread
         # via this queue so the blocking nvidia-smi call never freezes the UI.
@@ -171,7 +181,7 @@ class GPUMonitorApp:
         )
         mem_lo, mem_hi = r["system_memory"]
         self.gauge_sys_mem = Gauge(
-            self.root, "System Memory (%)", mem_lo, mem_hi,
+            self.root, "System Memory (GB)", mem_lo, mem_hi,
             normal_color=gc["system_memory"]["normal"],
             warn_color=gc["system_memory"]["warn"],
             crit_color=gc["system_memory"]["crit"],
@@ -255,15 +265,13 @@ class GPUMonitorApp:
         else:
             self.gauge_power.show_na()
 
-        # System memory
-        if mem_pct is not None:
-            subtitle = (
-                f"{self.metrics.format_memory_gb(mem_used)} / "
-                f"{self.metrics.format_memory_gb(mem_total)}"
-            )
-            self.gauge_sys_mem.update_value(mem_pct, subtitle)
+        # System memory — now displayed in GB instead of percentage
+        if mem_used is not None and mem_total is not None and mem_pct is not None:
+            # Primary value = used GB; subtitle shows the full breakdown
+            subtitle = f"{mem_used:.1f} GB / {mem_total:.1f} GB ({mem_pct:.0f}%)"
+            self.gauge_sys_mem.update_value(mem_used, subtitle)
             if self.gauge_sys_mem.state in ("warning", "critical"):
-                log_threshold_breach("System Memory (%)", mem_pct, self.gauge_sys_mem.state)
+                log_threshold_breach("System Memory (GB)", mem_used, self.gauge_sys_mem.state)
         else:
             self.gauge_sys_mem.show_na()
 
@@ -342,7 +350,7 @@ class GPUMonitorApp:
         """
         Unified preferences dialog covering:
           FUN-04  Update interval
-          FUN-10  Per-metric warning / critical thresholds (% of full-scale)
+          FUN-10  Per-metric warning / critical thresholds (now in metric's native units)
           FUN-11  Per-metric normal / warning / critical arc colours
           FUN-13  Gauge size (normal / small)
         """
@@ -362,7 +370,7 @@ class GPUMonitorApp:
                 fg="#ffffff", bg=COLORS["menu_bg"],
                 font=("Segoe UI", 10, "bold"),
                 anchor="w", relief="flat",
-            ).grid(row=row, column=0, columnspan=4, sticky="ew",
+            ).grid(row=row, column=0, columnspan=5, sticky="ew",
                    padx=0, pady=(12, 2))
 
         # ── Update interval (FUN-04) ──────────────────────────────────────────
@@ -395,44 +403,76 @@ class GPUMonitorApp:
                 font=("Segoe UI", 10),
             ).grid(row=3, column=col, sticky="w", **pad)
 
-        # ── Thresholds (FUN-10) ───────────────────────────────────────────────
-        section(dialog, "  Thresholds (% of full-scale)", 4)
+        # ── Thresholds (FUN-10) ─────────────────────────────────────────────
+        # Thresholds are now shown in the native units of each metric.
+        # Internally they are still stored as percentages in the config for
+        # persistence; the dialog converts between pct and absolute units.
+        section(dialog, "  Thresholds", 4)
 
-        METRIC_LABELS = [
-            ("temperature",   "Temperature"),
-            ("utilization",   "GPU Utilization"),
-            ("power",         "Power"),
-            ("system_memory", "System Memory"),
+        # Metric metadata: (key, display_label, unit_symbol)
+        METRIC_META = [
+            ("temperature",   "Temperature",   "\u00b0C"),
+            ("utilization",   "GPU Utilization", "%"),
+            ("power",         "Power",           "W"),
+            ("system_memory", "System Memory",   "GB"),
         ]
 
-        # Column headers
-        for col, hdr in enumerate(["Metric", "Warn %", "Crit %"], start=0):
+        # Column headers: Metric, Warn, Crit
+        headers = ["Metric", "Warn", "Crit"]
+        for col, hdr in enumerate(headers, start=0):
             tk.Label(
                 dialog, text=hdr,
                 fg=COLORS["text_dim"], bg=COLORS["bg"],
                 font=("Segoe UI", 9, "bold"),
             ).grid(row=5, column=col, sticky="w", **pad)
 
-        thresh_vars = {}   # {metric_key: {"warn": IntVar, "crit": IntVar}}
-        for i, (key, label) in enumerate(METRIC_LABELS):
+        thresh_vars = {}  # {metric_key: {"warn": DoubleVar, "crit": DoubleVar}}
+        for i, (key, label, unit) in enumerate(METRIC_META):
             row = 6 + i
             tk.Label(
                 dialog, text=label,
                 fg=COLORS["text_main"], bg=COLORS["bg"], font=("Segoe UI", 10),
             ).grid(row=row, column=0, sticky="w", **pad)
 
-            warn_var = tk.DoubleVar(value=self._thresholds_pct[key]["warn"])
-            crit_var = tk.DoubleVar(value=self._thresholds_pct[key]["crit"])
+            # Convert from stored percentage to absolute value for display
+            warn_abs = pct_to_abs(key, self._thresholds_pct[key]["warn"], self._metric_ranges)
+            crit_abs = pct_to_abs(key, self._thresholds_pct[key]["crit"], self._metric_ranges)
+
+            warn_var = tk.DoubleVar(value=warn_abs)
+            crit_var = tk.DoubleVar(value=crit_abs)
             thresh_vars[key] = {"warn": warn_var, "crit": crit_var}
 
-            for col, var in [(1, warn_var), (2, crit_var)]:
-                tk.Spinbox(
-                    dialog, from_=0, to=100, increment=1,
-                    textvariable=var, width=6,
-                    bg=COLORS["menu_bg"], fg=COLORS["text_main"],
-                    buttonbackground=COLORS["menu_active_bg"],
-                    font=("Segoe UI", 10),
-                ).grid(row=row, column=col, sticky="w", **pad)
+            # Warn spinbox
+            tk.Spinbox(
+                dialog, from_=0, to=self._metric_ranges[key][1], increment=1,
+                textvariable=warn_var, width=6,
+                bg=COLORS["menu_bg"], fg=COLORS["text_main"],
+                buttonbackground=COLORS["menu_active_bg"],
+                font=("Segoe UI", 10),
+            ).grid(row=row, column=1, sticky="w", **pad)
+
+            # Unit label next to Warn spinbox
+            tk.Label(
+                dialog, text=unit,
+                fg=COLORS["text_dim"], bg=COLORS["bg"],
+                font=("Segoe UI", 8),
+            ).grid(row=row, column=2, sticky="e", **pad)
+
+            # Crit spinbox
+            tk.Spinbox(
+                dialog, from_=0, to=self._metric_ranges[key][1], increment=1,
+                textvariable=crit_var, width=6,
+                bg=COLORS["menu_bg"], fg=COLORS["text_main"],
+                buttonbackground=COLORS["menu_active_bg"],
+                font=("Segoe UI", 10),
+            ).grid(row=row, column=3, sticky="w", **pad)
+
+            # Unit label next to Crit spinbox
+            tk.Label(
+                dialog, text=unit,
+                fg=COLORS["text_dim"], bg=COLORS["bg"],
+                font=("Segoe UI", 8),
+            ).grid(row=row, column=4, sticky="e", **pad)
 
         # ── Gauge colours (FUN-11) ────────────────────────────────────────────
         section(dialog, "  Gauge Colours", 10)
@@ -468,13 +508,13 @@ class GPUMonitorApp:
                 if chosen:
                     setattr(g, a, chosen)
                     b.configure(bg=chosen)
-                    g.update_value(g.value)   # immediate redraw (FUN-11)
+                    g.update_value(g.value)  # immediate redraw (FUN-11)
 
             btn.configure(command=_pick)
             btn.grid(row=row, column=col, sticky="w", **pad)
 
         COLOR_ATTRS = [("normal_color", "normal"), ("warn_color", "warn"), ("crit_color", "crit")]
-        for i, (key, label) in enumerate(METRIC_LABELS):
+        for i, (key, label, unit) in enumerate(METRIC_META):
             row = 12 + i
             tk.Label(
                 dialog, text=label,
@@ -485,34 +525,43 @@ class GPUMonitorApp:
 
         # ── OK / Cancel ───────────────────────────────────────────────────────
         def _apply():
-            # ── Parse + validate thresholds first (FUN-10) ────────────────────
-            # warn must not exceed crit, otherwise the warning band would be
-            # unreachable (update_value checks crit before warn). Validate
-            # before applying anything so a bad entry leaves all state untouched
-            # and the dialog stays open for the user to fix.
+            # ── Parse + validate thresholds (FUN-10) ────────────────────────
+            # Thresholds are stored internally as percentages. Parse the
+            # absolute values back to percentages for persistence.
             parsed = {}
-            violations = []
-            for key, label in METRIC_LABELS:
-                try:
-                    warn_pct = max(0.0, min(100.0, float(thresh_vars[key]["warn"].get())))
-                    crit_pct = max(0.0, min(100.0, float(thresh_vars[key]["crit"].get())))
-                except (ValueError, tk.TclError):
-                    warn_pct = self._thresholds_pct[key]["warn"]
-                    crit_pct = self._thresholds_pct[key]["crit"]
-                if warn_pct > crit_pct:
-                    violations.append(label)
-                parsed[key] = {"warn": warn_pct, "crit": crit_pct}
+            for key, label, unit in METRIC_META:
+                range_lo, range_hi = self._metric_ranges[key]
+                range_span = range_hi - range_lo if range_hi > range_lo else 1.0
 
-            if violations:
-                messagebox.showwarning(
-                    "Invalid Thresholds",
-                    "The warning threshold must not exceed the critical "
-                    "threshold for:\n\n"
-                    + "\n".join(f"  • {v}" for v in violations)
-                    + "\n\nPlease adjust the values and try again.",
-                    parent=dialog,
-                )
-                return  # keep the dialog open
+                try:
+                    warn_abs = float(thresh_vars[key]["warn"].get())
+                    crit_abs = float(thresh_vars[key]["crit"].get())
+                except (ValueError, tk.TclError):
+                    warn_abs = pct_to_abs(key, self._thresholds_pct[key]["warn"], self._metric_ranges)
+                    crit_abs = pct_to_abs(key, self._thresholds_pct[key]["crit"], self._metric_ranges)
+
+                # Clamp absolute values to range
+                warn_abs = max(range_lo, min(range_hi, warn_abs))
+                crit_abs = max(range_lo, min(range_hi, crit_abs))
+
+                # Convert back to percentage for storage
+                warn_pct = ((warn_abs - range_lo) / range_span) * 100.0
+                crit_pct = ((crit_abs - range_lo) / range_span) * 100.0
+                warn_pct = max(0.0, min(100.0, warn_pct))
+                crit_pct = max(0.0, min(100.0, crit_pct))
+
+                if warn_pct > crit_pct:
+                    messagebox.showwarning(
+                        "Invalid Thresholds",
+                        "The warning threshold must not exceed the critical "
+                        "threshold for:\n\n"
+                        f"  • {label}\n\n"
+                        "Please adjust the values and try again.",
+                        parent=dialog,
+                    )
+                    return  # keep the dialog open
+
+                parsed[key] = {"warn": warn_pct, "crit": crit_pct}
 
             # Interval (FUN-04)
             try:
@@ -529,11 +578,13 @@ class GPUMonitorApp:
                 for g in self._all_gauges():
                     g.resize(new_size)
 
-            # Thresholds (FUN-10) — push validated absolute values to gauges
-            for key, _ in METRIC_LABELS:
+            # Thresholds — push validated absolute values to gauges
+            for key, label, unit in METRIC_META:
                 g = gauge_map[key]
-                g.warn_threshold = pct_to_abs(key, parsed[key]["warn"], self._metric_ranges)
-                g.crit_threshold = pct_to_abs(key, parsed[key]["crit"], self._metric_ranges)
+                abs_warn = pct_to_abs(key, parsed[key]["warn"], self._metric_ranges)
+                abs_crit = pct_to_abs(key, parsed[key]["crit"], self._metric_ranges)
+                g.warn_threshold = abs_warn
+                g.crit_threshold = abs_crit
             self._thresholds_pct = parsed
 
             # Persist everything
@@ -547,7 +598,7 @@ class GPUMonitorApp:
             dialog.destroy()
 
         btn_frame = tk.Frame(dialog, bg=COLORS["bg"])
-        btn_frame.grid(row=16, column=0, columnspan=4, pady=(12, 16))
+        btn_frame.grid(row=16, column=0, columnspan=7, pady=(12, 16))
         tk.Button(
             btn_frame, text="OK", command=_apply, width=8,
             bg=COLORS["menu_active_bg"], fg=COLORS["text_main"],

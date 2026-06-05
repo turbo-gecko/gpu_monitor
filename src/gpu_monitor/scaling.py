@@ -14,7 +14,7 @@ DEFAULT_METRIC_RANGES = {
     "temperature":   (0, 95),
     "utilization":   (0, 100),
     "power":         (0, 140),
-    "system_memory": (0, 100),
+    "system_memory": (0, 0),  # Max is set dynamically from detected total RAM
 }
 
 

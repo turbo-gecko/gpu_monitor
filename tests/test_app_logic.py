@@ -80,16 +80,23 @@ class TestPctToAbs(unittest.TestCase):
         self.assertAlmostEqual(_pct_to_abs("power", 50), 70.0, places=1)
 
     def test_system_memory_90_pct(self):
-        """90% of system memory range (0-100) = 90."""
-        self.assertAlmostEqual(_pct_to_abs("system_memory", 90), 90.0, places=1)
+        """90% of system memory range (0-64) = 57.6."""
+        custom_ranges = {"system_memory": (0, 64)}
+        self.assertAlmostEqual(pct_to_abs("system_memory", 90, custom_ranges), 57.6, places=1)
 
     def test_system_memory_100_pct(self):
-        """100% of system memory = 100."""
-        self.assertAlmostEqual(_pct_to_abs("system_memory", 100), 100.0, places=1)
+        """100% of system memory range (0-64) = 64."""
+        custom_ranges = {"system_memory": (0, 64)}
+        self.assertAlmostEqual(pct_to_abs("system_memory", 100, custom_ranges), 64.0, places=1)
 
     def test_system_memory_0_pct(self):
         """0% of system memory = 0."""
-        self.assertAlmostEqual(_pct_to_abs("system_memory", 0), 0.0, places=1)
+        custom_ranges = {"system_memory": (0, 64)}
+        self.assertAlmostEqual(pct_to_abs("system_memory", 0, custom_ranges), 0.0, places=1)
+
+    def test_system_memory_default_is_zero_range(self):
+        """Default system_memory range should be (0, 0) — max set dynamically."""
+        self.assertEqual(DEFAULT_METRIC_RANGES["system_memory"], (0, 0))
 
     def test_invalid_metric_returns_zero(self):
         """Unknown metric should return 0."""

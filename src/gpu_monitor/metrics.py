@@ -154,6 +154,28 @@ class MetricsFetcher:
             return None, None, None
 
     @staticmethod
+    def fetch_total_memory_gb():
+        """
+        Get the total system memory in GB from /proc/meminfo (Linux, no sudo required).
+        Returns total_gb as a float, or None on failure.
+        """
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    key = parts[0].rstrip(':')
+                    if key == 'MemTotal':
+                        total_kb = int(parts[1])
+                        if total_kb > 0:
+                            return total_kb / (1024 * 1024)
+                        return None
+            return None
+        except (IOError, OSError, ValueError, IndexError):
+            return None
+
+    @staticmethod
     def format_memory_gb(gb):
         """Format GB value nicely for display"""
         if gb is None:
