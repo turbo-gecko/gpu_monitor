@@ -74,16 +74,20 @@ class Gauge(tk.Frame):
         self.canvas.pack(side="top", pady=15)
 
         # Background track -- ARC style (stroke, not fill) (FUN-06)
+        # Car rev counter style: starts at left (~7-8 o'clock), rises through top (12 o'clock), ends at right (~4-5 o'clock).
+        # Sweep counter-clockwise from left → top → right (180° arc with opening at bottom, arch shape ⌢).
         self.arc_bg_id = self.canvas.create_arc(
             d["pad"], d["pad"], d["arc_end"], d["arc_end"],
-            start=135, extent=270,
+            start=0, extent=180,
             style=tk.ARC, width=d["track_outline"], outline="#333333",
         )
 
         # Progress arc -- ARC style so it matches the track (FUN-06, FUN-07)
+        # Fills upward (left-to-right along the arch) as value increases.
+        # Total sweep is 180° (counter-clockwise from left → top → right).
         self.arc_id = self.canvas.create_arc(
             d["pad"], d["pad"], d["arc_end"], d["arc_end"],
-            start=135, extent=0,
+            start=180, extent=0,
             style=tk.ARC, width=d["arc_width"], outline=self.normal_color,
         )
 
@@ -133,7 +137,7 @@ class Gauge(tk.Frame):
         self.value = val
         val_range  = self.max_val - self.min_val
         pct        = max(0.0, min(1.0, (val - self.min_val) / val_range)) if val_range > 0 else 0.0
-        extent     = 270 * pct
+        extent     = 180 * pct
 
         if self.crit_threshold is not None and val >= self.crit_threshold:
             self.state = "critical"
@@ -151,7 +155,7 @@ class Gauge(tk.Frame):
             show_alert = False
             icon       = ""
 
-        self.canvas.itemconfigure(self.arc_id,    extent=extent, outline=arc_color)
+        self.canvas.itemconfigure(self.arc_id, start=180 - extent, extent=extent, outline=arc_color)
         self.canvas.itemconfigure(self.text_id,   text=f"{val:.1f}")
         self.canvas.itemconfigure(
             self.warn_text, text=icon,
@@ -170,7 +174,7 @@ class Gauge(tk.Frame):
         """Reset the gauge and display N/A -- satisfies FUN-05."""
         self._alert_active = False
         self.state         = "normal"
-        self.canvas.itemconfigure(self.arc_id,    extent=0, outline=self.normal_color)
+        self.canvas.itemconfigure(self.arc_id, start=180, extent=0, outline=self.normal_color)
         self.canvas.itemconfigure(self.text_id,   text="N/A")
         self.canvas.itemconfigure(self.warn_text, text="", state="hidden")
         self.title_label.config(text=self.title)
@@ -189,6 +193,7 @@ class Gauge(tk.Frame):
         self.canvas.configure(width=d["size"], height=d["size"])
 
         self.canvas.coords(self.arc_bg_id, d["pad"], d["pad"], d["arc_end"], d["arc_end"])
+        self.canvas.itemconfigure(self.arc_bg_id, start=0, extent=180)
         self.canvas.itemconfigure(self.arc_bg_id, width=d["track_outline"])
 
         self.canvas.coords(self.arc_id, d["pad"], d["pad"], d["arc_end"], d["arc_end"])
