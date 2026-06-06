@@ -27,6 +27,8 @@ from gpu_monitor.config import (
     load_window_state,
     save_window_state,
     get_geometry_for_layout,
+    parse_geometry,
+    format_geometry,
     DEFAULT_THRESHOLDS,
     DEFAULT_GAUGE_COLORS,
     DEFAULT_WINDOW_STATE,
@@ -426,6 +428,32 @@ class TestGetGeometryForLayout(unittest.TestCase):
         # When state is None, it should call load_window_state().
         # We can't easily test this without a real file, so skip.
         pass
+
+
+class TestGeometryHelpers(unittest.TestCase):
+    """parse_geometry / format_geometry bridge the stored string to Qt's QRect."""
+
+    def test_parse_basic(self):
+        self.assertEqual(parse_geometry("900x320+100+50"), (900, 320, 100, 50))
+
+    def test_parse_negative_offsets(self):
+        self.assertEqual(parse_geometry("250x650-10-20"), (250, 650, -10, -20))
+
+    def test_format_basic(self):
+        self.assertEqual(format_geometry(900, 320, 100, 50), "900x320+100+50")
+
+    def test_format_negative_offsets(self):
+        self.assertEqual(format_geometry(250, 650, -10, -20), "250x650-10-20")
+
+    def test_round_trip(self):
+        for geom in ("900x320+100+50", "250x650+0+0", "640x480-5+12"):
+            self.assertEqual(format_geometry(*parse_geometry(geom)), geom)
+
+    def test_parse_malformed_falls_back_to_default(self):
+        # Falls back to the default horizontal geometry rather than raising.
+        default = DEFAULT_WINDOW_STATE["horizontal_geometry"]
+        self.assertEqual(parse_geometry("garbage"), parse_geometry(default))
+        self.assertEqual(parse_geometry(""), parse_geometry(default))
 
 
 if __name__ == "__main__":

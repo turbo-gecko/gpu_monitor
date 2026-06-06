@@ -4,10 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gpu-monitor"
-version = "1.3.0"
-description = "Tkinter NVIDIA GPU & system memory monitor (no sudo, Linux only)"
+version = "2.0.0"
+description = "PySide6 NVIDIA GPU & system memory monitor (no sudo, Linux only)"
 requires-python = ">=3.10"
-dependencies = []  # standard library only (tkinter)
+dependencies = [
+    "PySide6>=6.6",
+    "qt-material>=2.14",
+]
 
 [project.scripts]
 gpu-monitor = "gpu_monitor.cli:main"

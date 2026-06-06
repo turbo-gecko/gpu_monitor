@@ -68,6 +68,29 @@ def _is_valid_geometry(value: str) -> bool:
     return isinstance(value, str) and bool(_GEOMETRY_RE.match(value))
 
 
+def parse_geometry(value: str) -> tuple[int, int, int, int]:
+    """
+    Parse an X11 geometry string ``"WxH+X+Y"`` into ``(width, height, x, y)``.
+
+    The format is framework-agnostic (used by both Tk and the config file); this
+    helper bridges the stored string to Qt's ``setGeometry(x, y, w, h)`` API.
+    Falls back to the default horizontal geometry on a malformed string so the
+    window always opens somewhere sensible (FUN-09, FUN-12).
+    """
+    m = re.match(r'^(\d+)x(\d+)([+-]\d+)([+-]\d+)$', value or "")
+    if m is None:
+        m = re.match(r'^(\d+)x(\d+)([+-]\d+)([+-]\d+)$',
+                     DEFAULT_WINDOW_STATE["horizontal_geometry"])
+    assert m is not None  # default is always well-formed
+    w, h, x, y = m.groups()
+    return int(w), int(h), int(x), int(y)
+
+
+def format_geometry(width: int, height: int, x: int, y: int) -> str:
+    """Format ``(width, height, x, y)`` back into an ``"WxH+X+Y"`` string."""
+    return f"{int(width)}x{int(height)}{int(x):+d}{int(y):+d}"
+
+
 def _is_valid_interval(value) -> bool:
     return isinstance(value, (int, float)) and UPDATE_INTERVAL_MIN_S <= value <= UPDATE_INTERVAL_MAX_S
 
