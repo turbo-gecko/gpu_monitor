@@ -14,10 +14,13 @@ Qt signal).
 
 import threading
 
-from .mqtt_publisher import _make_client, METRIC_KEYS, SYSTEM_MEMORY_TOTAL_KEY
+from .mqtt_publisher import (
+    _make_client, METRIC_KEYS, SYSTEM_MEMORY_TOTAL_KEY, THRESHOLD_KEYS,
+)
 
-# Topics the subscriber accepts: the gauge metrics plus the total-RAM value.
-_ALLOWED_KEYS = set(METRIC_KEYS) | {SYSTEM_MEMORY_TOTAL_KEY}
+# Topics the subscriber accepts: the gauge metrics, the total-RAM value, and the
+# per-metric warn/crit thresholds.
+_ALLOWED_KEYS = set(METRIC_KEYS) | {SYSTEM_MEMORY_TOTAL_KEY} | set(THRESHOLD_KEYS)
 
 
 def _parse_message(topic, payload, prefix):
@@ -26,7 +29,8 @@ def _parse_message(topic, payload, prefix):
 
     Returns ``None`` when the topic is not ``<prefix>/<known-key>`` or the
     payload is not a number. *prefix* is ``"<machine>/<base_topic>"``. Accepts
-    the four gauge metrics plus ``system_memory_total``.
+    the four gauge metrics, ``system_memory_total``, and the per-metric
+    ``<metric>_warn`` / ``<metric>_crit`` thresholds.
     """
     expected = f"{prefix}/"
     if not topic.startswith(expected):

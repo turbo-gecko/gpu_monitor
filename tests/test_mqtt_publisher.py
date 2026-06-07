@@ -121,6 +121,15 @@ class TestMqttPublisher(unittest.TestCase):
         self.assertEqual(payloads["testhost/t/temperature"], "45.7")
         self.assertEqual(payloads["testhost/t/utilization"], "30.0")
 
+    def test_publishes_threshold_topics(self):
+        fake = FakeClient()
+        with self._patch_client(fake):
+            pub = MqttPublisher(enabled=True, base_topic="gpu_monitor")
+            pub.publish({"temperature_warn": 85.0, "temperature_crit": 95.0})
+        payloads = {topic: payload for (topic, payload, _q, _r) in fake.published}
+        self.assertEqual(payloads["testhost/gpu_monitor/temperature_warn"], "85.0")
+        self.assertEqual(payloads["testhost/gpu_monitor/temperature_crit"], "95.0")
+
     def test_publishes_total_ram_topic(self):
         fake = FakeClient()
         with self._patch_client(fake):

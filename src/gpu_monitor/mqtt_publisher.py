@@ -20,6 +20,12 @@ METRIC_KEYS = ("temperature", "utilization", "power", "system_memory")
 # metric itself — handled specially on the subscribe side.
 SYSTEM_MEMORY_TOTAL_KEY = "system_memory_total"
 
+# Per-metric absolute warn/crit threshold topics (e.g. "temperature_warn"),
+# published so a remote subscriber colours its gauges with the publisher's
+# thresholds (FUN-15). Absolute values in native units — scale-independent.
+THRESHOLD_BOUNDS = ("warn", "crit")
+THRESHOLD_KEYS = tuple(f"{m}_{b}" for m in METRIC_KEYS for b in THRESHOLD_BOUNDS)
+
 
 def _hostname():
     """

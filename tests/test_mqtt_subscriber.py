@@ -76,6 +76,14 @@ class TestParseMessage(unittest.TestCase):
             _parse_message("Bishop/gpu_monitor/system_memory_total", "64.0", self.PREFIX),
             ("system_memory_total", 64.0))
 
+    def test_threshold_topics_are_accepted(self):
+        self.assertEqual(
+            _parse_message("Bishop/gpu_monitor/temperature_warn", "85.0", self.PREFIX),
+            ("temperature_warn", 85.0))
+        self.assertEqual(
+            _parse_message("Bishop/gpu_monitor/system_memory_crit", "62.7", self.PREFIX),
+            ("system_memory_crit", 62.7))
+
     def test_non_numeric_payload_returns_none(self):
         self.assertIsNone(_parse_message("Bishop/gpu_monitor/temperature", "N/A", self.PREFIX))
 

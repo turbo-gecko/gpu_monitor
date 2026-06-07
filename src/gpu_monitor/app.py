@@ -280,6 +280,16 @@ class GPUMonitorApp(QMainWindow):
                 self._apply_remote_mem_total(value)
             return
 
+        # Threshold updates ("<metric>_warn" / "<metric>_crit"): apply the
+        # publisher's thresholds so colouring matches the remote machine (FUN-15).
+        for suffix, attr in (("_warn", "warn_threshold"), ("_crit", "crit_threshold")):
+            if key.endswith(suffix):
+                tg = self._gauge_map().get(key[: -len(suffix)])
+                if tg is not None and value is not None and getattr(tg, attr) != value:
+                    setattr(tg, attr, value)
+                    tg.update_value(tg.value)  # recolour at the new threshold
+                return
+
         g = self._gauge_map().get(key)
         if g is None:
             return
@@ -304,16 +314,14 @@ class GPUMonitorApp(QMainWindow):
         """
         Rescale the memory gauge to a remote machine's total RAM (FUN-15).
 
-        Updates the full-scale and recomputes the absolute warn/crit thresholds
-        from the stored percentages so colouring stays correct on the new scale.
+        Sets the full-scale (arc extent) only; the warn/crit thresholds are
+        driven separately by the published ``system_memory_warn`` / ``_crit``
+        topics, so they are not recomputed here.
         """
         self._remote_mem_total = total
         self._metric_ranges["system_memory"] = (0, total)
         g = self.gauge_sys_mem
         g.max_val = total
-        pct = self._thresholds_pct["system_memory"]
-        g.warn_threshold = pct_to_abs("system_memory", pct["warn"], self._metric_ranges)
-        g.crit_threshold = pct_to_abs("system_memory", pct["crit"], self._metric_ranges)
         # Redraw at the new scale; keep the existing subtitle by recomputing it.
         g.update_value(g.value, self._remote_mem_subtitle(g.value))
 
@@ -357,16 +365,29 @@ class GPUMonitorApp(QMainWindow):
             self.gauge_sys_mem.show_na()
 
         # Publish the freshly-updated values to MQTT (FUN-14). No-op unless
-        # enabled; None (N/A) metrics are skipped by the publisher. The total RAM
-        # is published too so a remote subscriber can scale its memory gauge to
-        # this machine's full-scale (FUN-15).
-        self._mqtt.publish({
+        # enabled; None (N/A) metrics are skipped by the publisher. Total RAM and
+        # the per-metric thresholds are published too so a remote subscriber can
+        # scale its memory gauge and colour its gauges with this machine's
+        # thresholds (FUN-15).
+        payload = {
             "temperature":         temp,
             "utilization":         util,
             "power":               power,
             "system_memory":       mem_used,
             "system_memory_total": mem_total,
-        })
+        }
+        payload.update(self._threshold_payload())
+        self._mqtt.publish(payload)
+
+    def _threshold_payload(self) -> dict:
+        """Per-metric absolute warn/crit thresholds for publishing (FUN-15)."""
+        out = {}
+        for key, g in self._gauge_map().items():
+            if g.warn_threshold is not None:
+                out[f"{key}_warn"] = g.warn_threshold
+            if g.crit_threshold is not None:
+                out[f"{key}_crit"] = g.crit_threshold
+        return out
 
     # ── Layout switching ──────────────────────────────────────────────────────
 
@@ -646,6 +667,12 @@ class PreferencesDialog(QDialog):
         self.mqtt_sub_enable.toggled.connect(
             lambda on: self.mqtt_enable.setChecked(False) if on else None)
 
+        # In subscribe mode the thresholds come from the remote machine, so local
+        # threshold editing is disabled (FUN-15).
+        self.mqtt_sub_enable.toggled.connect(
+            lambda on: self._set_thresholds_enabled(not on))
+        self._set_thresholds_enabled(not self.mqtt_sub_enable.isChecked())
+
         # ── OK / Cancel ───────────────────────────────────────────────────────
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -670,6 +697,12 @@ class PreferencesDialog(QDialog):
         spin.setSingleStep(1.0)
         spin.setValue(float(value))
         return spin
+
+    def _set_thresholds_enabled(self, enabled: bool):
+        """Enable/disable the threshold spinboxes (disabled in subscribe mode)."""
+        for spins in self.thresh_spins.values():
+            spins["warn"].setEnabled(enabled)
+            spins["crit"].setEnabled(enabled)
 
     def _make_color_button(self, key: str, state_key: str) -> QPushButton:
         btn = QPushButton()
@@ -697,25 +730,29 @@ class PreferencesDialog(QDialog):
         # ── Parse + validate thresholds (FUN-10) ─────────────────────────────
         # Thresholds are stored as percentages; convert the absolute spinbox
         # values back to percentages for persistence and re-validate warn ≤ crit.
-        parsed = {}
-        for key, label, _ in METRIC_META:
-            lo, hi = app._metric_ranges[key]
-            span = hi - lo if hi > lo else 1.0
-            warn_abs = max(lo, min(hi, self.thresh_spins[key]["warn"].value()))
-            crit_abs = max(lo, min(hi, self.thresh_spins[key]["crit"].value()))
-            warn_pct = max(0.0, min(100.0, (warn_abs - lo) / span * 100.0))
-            crit_pct = max(0.0, min(100.0, (crit_abs - lo) / span * 100.0))
+        # In subscribe mode thresholds come from the remote machine and local
+        # editing is disabled (FUN-15), so this is skipped and left as-is.
+        parsed = None
+        if not self.mqtt_sub_enable.isChecked():
+            parsed = {}
+            for key, label, _ in METRIC_META:
+                lo, hi = app._metric_ranges[key]
+                span = hi - lo if hi > lo else 1.0
+                warn_abs = max(lo, min(hi, self.thresh_spins[key]["warn"].value()))
+                crit_abs = max(lo, min(hi, self.thresh_spins[key]["crit"].value()))
+                warn_pct = max(0.0, min(100.0, (warn_abs - lo) / span * 100.0))
+                crit_pct = max(0.0, min(100.0, (crit_abs - lo) / span * 100.0))
 
-            if warn_pct > crit_pct:
-                QMessageBox.warning(
-                    self, "Invalid Thresholds",
-                    "The warning threshold must not exceed the critical "
-                    f"threshold for:\n\n  • {label}\n\n"
-                    "Please adjust the values and try again.",
-                )
-                return  # keep the dialog open, nothing applied
+                if warn_pct > crit_pct:
+                    QMessageBox.warning(
+                        self, "Invalid Thresholds",
+                        "The warning threshold must not exceed the critical "
+                        f"threshold for:\n\n  • {label}\n\n"
+                        "Please adjust the values and try again.",
+                    )
+                    return  # keep the dialog open, nothing applied
 
-            parsed[key] = {"warn": warn_pct, "crit": crit_pct}
+                parsed[key] = {"warn": warn_pct, "crit": crit_pct}
 
         # Layout (FUN-09)
         new_layout = "Vertical" if self._rb_vertical.isChecked() else "Horizontal"
@@ -733,17 +770,20 @@ class PreferencesDialog(QDialog):
             for g in app._all_gauges():
                 g.set_size(new_size)
 
-        # Thresholds + colours pushed to the gauges.
+        # Colours always pushed to the gauges; thresholds only when not in
+        # subscribe mode (otherwise the remote-published thresholds rule, FUN-15).
         gm = app._gauge_map()
         for key, _, _ in METRIC_META:
             g = gm[key]
-            g.warn_threshold = pct_to_abs(key, parsed[key]["warn"], app._metric_ranges)
-            g.crit_threshold = pct_to_abs(key, parsed[key]["crit"], app._metric_ranges)
+            if parsed is not None:
+                g.warn_threshold = pct_to_abs(key, parsed[key]["warn"], app._metric_ranges)
+                g.crit_threshold = pct_to_abs(key, parsed[key]["crit"], app._metric_ranges)
             g.normal_color = self.colors[key]["normal"]
             g.warn_color   = self.colors[key]["warn"]
             g.crit_color   = self.colors[key]["crit"]
             g.update_value(g.value)  # immediate redraw (FUN-11)
-        app._thresholds_pct = parsed
+        if parsed is not None:
+            app._thresholds_pct = parsed
 
         # MQTT settings (FUN-14, FUN-15): collect, apply to the live publisher /
         # subscriber, switch poll mode, persist. The dialog's mutual-exclusivity
