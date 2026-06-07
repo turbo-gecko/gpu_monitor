@@ -26,6 +26,7 @@ from gpu_monitor.config import (
     _validate_gauge_colors,
     _is_valid_port,
     _validate_mqtt,
+    _validate_mqtt_subscribe,
     load_window_state,
     save_window_state,
     get_geometry_for_layout,
@@ -34,6 +35,7 @@ from gpu_monitor.config import (
     DEFAULT_THRESHOLDS,
     DEFAULT_GAUGE_COLORS,
     DEFAULT_MQTT,
+    DEFAULT_MQTT_SUBSCRIBE,
     DEFAULT_WINDOW_STATE,
     UPDATE_INTERVAL_MIN_S,
     UPDATE_INTERVAL_MAX_S,
@@ -360,6 +362,38 @@ class TestValidateMqtt(unittest.TestCase):
         self.assertEqual(result["host"], DEFAULT_MQTT["host"])
 
 
+class TestValidateMqttSubscribe(unittest.TestCase):
+    """FUN-15 — MQTT subscribe settings validation logic."""
+
+    def test_all_valid(self):
+        raw = {"enabled": True, "host": "10.0.0.5", "port": 1884,
+               "base_topic": "rig", "machine": "Bishop"}
+        self.assertEqual(_validate_mqtt_subscribe(raw), raw)
+
+    def test_missing_returns_defaults(self):
+        self.assertEqual(_validate_mqtt_subscribe({}), DEFAULT_MQTT_SUBSCRIBE)
+
+    def test_non_dict_returns_defaults(self):
+        self.assertEqual(_validate_mqtt_subscribe(None), DEFAULT_MQTT_SUBSCRIBE)
+
+    def test_empty_machine_is_accepted(self):
+        # machine defaults to "" (unset); empty string is valid, not a fallback.
+        result = _validate_mqtt_subscribe({"machine": ""})
+        self.assertEqual(result["machine"], "")
+
+    def test_non_string_machine_falls_back(self):
+        result = _validate_mqtt_subscribe({"machine": 123})
+        self.assertEqual(result["machine"], DEFAULT_MQTT_SUBSCRIBE["machine"])
+
+    def test_out_of_range_port_falls_back(self):
+        result = _validate_mqtt_subscribe({"port": 0})
+        self.assertEqual(result["port"], DEFAULT_MQTT_SUBSCRIBE["port"])
+
+    def test_non_bool_enabled_falls_back(self):
+        result = _validate_mqtt_subscribe({"enabled": 1})
+        self.assertEqual(result["enabled"], DEFAULT_MQTT_SUBSCRIBE["enabled"])
+
+
 class TestLoadWindowState(unittest.TestCase):
     """FUN-09, FUN-12 — config file loading."""
 
@@ -456,6 +490,37 @@ class TestLoadWindowState(unittest.TestCase):
         result = load_window_state()
         self.assertEqual(result["mqtt"], mqtt)
 
+    def test_mqtt_subscribe_defaults_when_absent(self):
+        config_file = os.path.join(self.temp_dir.name, "config.json")
+        with open(config_file, "w") as f:
+            json.dump({"layout": "Horizontal"}, f)
+        result = load_window_state()
+        self.assertEqual(result["mqtt_subscribe"], DEFAULT_MQTT_SUBSCRIBE)
+
+    def test_mqtt_subscribe_valid_is_loaded(self):
+        config_file = os.path.join(self.temp_dir.name, "config.json")
+        sub = {"enabled": True, "host": "10.0.0.9", "port": 1883,
+               "base_topic": "gpu_monitor", "machine": "Bishop"}
+        with open(config_file, "w") as f:
+            json.dump({"layout": "Horizontal", "mqtt_subscribe": sub}, f)
+        result = load_window_state()
+        self.assertEqual(result["mqtt_subscribe"], sub)
+
+    def test_publish_and_subscribe_both_enabled_disables_subscribe(self):
+        # Mutual exclusivity (FUN-15): publishing wins if a config enables both.
+        config_file = os.path.join(self.temp_dir.name, "config.json")
+        payload = {
+            "layout": "Horizontal",
+            "mqtt": {"enabled": True, "host": "h", "port": 1883, "base_topic": "t"},
+            "mqtt_subscribe": {"enabled": True, "host": "h", "port": 1883,
+                               "base_topic": "t", "machine": "Bishop"},
+        }
+        with open(config_file, "w") as f:
+            json.dump(payload, f)
+        result = load_window_state()
+        self.assertTrue(result["mqtt"]["enabled"])
+        self.assertFalse(result["mqtt_subscribe"]["enabled"])
+
 
 class TestSaveWindowState(unittest.TestCase):
     """FUN-09, FUN-12 — config file saving."""
@@ -508,6 +573,22 @@ class TestSaveWindowState(unittest.TestCase):
         with open(config_file, "r") as f:
             saved = json.load(f)
         self.assertEqual(saved["mqtt"], DEFAULT_MQTT)
+
+    def test_mqtt_subscribe_is_persisted(self):
+        sub = {"enabled": True, "host": "broker", "port": 1883,
+               "base_topic": "gpu", "machine": "Bishop"}
+        save_window_state("900x320+100+50", "Horizontal", mqtt_subscribe=sub)
+        config_file = os.path.join(self.temp_dir.name, "config.json")
+        with open(config_file, "r") as f:
+            saved = json.load(f)
+        self.assertEqual(saved["mqtt_subscribe"], sub)
+
+    def test_mqtt_subscribe_defaults_when_absent_on_first_save(self):
+        save_window_state("900x320+100+50", "Horizontal")
+        config_file = os.path.join(self.temp_dir.name, "config.json")
+        with open(config_file, "r") as f:
+            saved = json.load(f)
+        self.assertEqual(saved["mqtt_subscribe"], DEFAULT_MQTT_SUBSCRIBE)
 
 
 class TestGetGeometryForLayout(unittest.TestCase):

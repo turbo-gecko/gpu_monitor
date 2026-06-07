@@ -38,12 +38,24 @@ DEFAULT_THRESHOLDS = {
 
 # ── MQTT publishing (FUN-14) ──────────────────────────────────────────────────
 # Opt-in: disabled by default so users without a broker are unaffected. Each
-# metric is published to "<base_topic>/<metric>" when enabled.
+# metric is published to "<hostname>/<base_topic>/<metric>" when enabled.
 DEFAULT_MQTT = {
     "enabled":    False,
     "host":       "localhost",
     "port":       1883,
     "base_topic": "gpu_monitor",
+}
+
+# ── MQTT subscribe / remote monitoring (FUN-15) ───────────────────────────────
+# Opt-in remote mode: instead of reading local nvidia-smi/proc, subscribe to the
+# metrics another machine publishes (per FUN-14) at "<machine>/<base_topic>/+".
+# Mutually exclusive with publishing (enforced on load and in the dialog).
+DEFAULT_MQTT_SUBSCRIBE = {
+    "enabled":    False,
+    "host":       "localhost",
+    "port":       1883,
+    "base_topic": "gpu_monitor",
+    "machine":    "",
 }
 
 # ── App-chrome colours (not user-configurable) ────────────────────────────────
@@ -68,6 +80,7 @@ DEFAULT_WINDOW_STATE = {
     "thresholds":          DEFAULT_THRESHOLDS,
     "gauge_colors":        DEFAULT_GAUGE_COLORS,
     "mqtt":                DEFAULT_MQTT,
+    "mqtt_subscribe":      DEFAULT_MQTT_SUBSCRIBE,
 }
 
 
@@ -181,6 +194,28 @@ def _validate_mqtt(raw) -> dict:
     return result
 
 
+def _validate_mqtt_subscribe(raw) -> dict:
+    """Return validated MQTT subscribe settings, falling back per-key to defaults."""
+    result = dict(DEFAULT_MQTT_SUBSCRIBE)
+    if not isinstance(raw, dict):
+        return result
+    enabled = raw.get("enabled")
+    if isinstance(enabled, bool):
+        result["enabled"] = enabled
+    host = raw.get("host")
+    if isinstance(host, str) and len(host) > 0:
+        result["host"] = host
+    if _is_valid_port(raw.get("port")):
+        result["port"] = raw["port"]
+    base_topic = raw.get("base_topic")
+    if isinstance(base_topic, str) and len(base_topic) > 0:
+        result["base_topic"] = base_topic
+    machine = raw.get("machine")
+    if isinstance(machine, str):  # may be empty until the user fills it in
+        result["machine"] = machine
+    return result
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def load_window_state() -> dict:
@@ -225,8 +260,14 @@ def load_window_state() -> dict:
     state["thresholds"]   = _validate_thresholds(raw.get("thresholds"))
     state["gauge_colors"] = _validate_gauge_colors(raw.get("gauge_colors"))
 
-    # MQTT publishing (per-key fallback handled inside helper)
-    state["mqtt"] = _validate_mqtt(raw.get("mqtt"))
+    # MQTT publishing and subscription (per-key fallback handled inside helpers)
+    state["mqtt"]           = _validate_mqtt(raw.get("mqtt"))
+    state["mqtt_subscribe"] = _validate_mqtt_subscribe(raw.get("mqtt_subscribe"))
+
+    # Mutual exclusivity (FUN-15): publishing and subscribing can never both be
+    # active. If a hand-edited config enables both, publishing wins.
+    if state["mqtt"]["enabled"] and state["mqtt_subscribe"]["enabled"]:
+        state["mqtt_subscribe"] = {**state["mqtt_subscribe"], "enabled": False}
 
     return state
 
@@ -239,6 +280,7 @@ def save_window_state(
     thresholds: dict | None = None,
     gauge_colors: dict | None = None,
     mqtt: dict | None = None,
+    mqtt_subscribe: dict | None = None,
 ) -> None:
     """
     Persist all user-configurable settings to CONFIG_FILE (FUN-09, FUN-12).
@@ -281,6 +323,11 @@ def save_window_state(
         saved["mqtt"] = mqtt
     elif "mqtt" not in saved:
         saved["mqtt"] = DEFAULT_MQTT
+
+    if mqtt_subscribe is not None:
+        saved["mqtt_subscribe"] = mqtt_subscribe
+    elif "mqtt_subscribe" not in saved:
+        saved["mqtt_subscribe"] = DEFAULT_MQTT_SUBSCRIBE
 
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:

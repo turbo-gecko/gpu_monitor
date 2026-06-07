@@ -15,6 +15,11 @@ import threading
 # The four canonical metric keys (matches scaling.DEFAULT_METRIC_RANGES).
 METRIC_KEYS = ("temperature", "utilization", "power", "system_memory")
 
+# Extra published value: the machine's total RAM (GB), so a remote subscriber
+# can scale its memory gauge to this machine's full-scale (FUN-15). Not a gauge
+# metric itself — handled specially on the subscribe side.
+SYSTEM_MEMORY_TOTAL_KEY = "system_memory_total"
+
 
 def _hostname():
     """
@@ -76,7 +81,7 @@ class MqttPublisher:
     def publish(self, metrics):
         """
         Publish each non-``None`` value in *metrics* to its own retained topic
-        ``<hostname>/<base_topic>/<metric>``.
+        ``<hostname>/<base_topic>/<metric>``, formatted to one decimal place.
 
         ``None`` values (an N/A metric) are skipped so consumers aren't fed a
         literal "None". Any failure is silent (FUN-14, FUN-05 philosophy).
@@ -89,7 +94,7 @@ class MqttPublisher:
                     continue
                 self._client.publish(
                     f"{self._hostname}/{self._base_topic}/{key}",
-                    str(value), qos=0, retain=True,
+                    f"{float(value):.1f}", qos=0, retain=True,
                 )
         except Exception:
             pass

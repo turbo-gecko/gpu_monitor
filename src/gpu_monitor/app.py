@@ -8,12 +8,13 @@ from PySide6.QtWidgets import (
 
 from .config import (
     UPDATE_INTERVAL_MIN_S, UPDATE_INTERVAL_MAX_S,
-    DEFAULT_THRESHOLDS, DEFAULT_GAUGE_COLORS, DEFAULT_MQTT,
+    DEFAULT_THRESHOLDS, DEFAULT_GAUGE_COLORS, DEFAULT_MQTT, DEFAULT_MQTT_SUBSCRIBE,
     load_window_state, save_window_state, get_geometry_for_layout,
     parse_geometry, format_geometry,
 )
 from .metrics import MetricsFetcher
-from .mqtt_publisher import MqttPublisher
+from .mqtt_publisher import MqttPublisher, SYSTEM_MEMORY_TOTAL_KEY
+from .mqtt_subscriber import MqttSubscriber
 from .scaling import pct_to_abs, resolve_ranges, DEFAULT_METRIC_RANGES
 from .ui_components import Gauge
 from .logger import log_threshold_breach
@@ -25,6 +26,13 @@ METRIC_META = [
     ("power",         "Power",           "W"),
     ("system_memory", "System Memory",   "GB"),
 ]
+# Per-metric label used in the threshold-breach log (FUN-08).
+LOG_LABELS = {
+    "temperature":   "Temperature (°C)",
+    "utilization":   "GPU Utilization (%)",
+    "power":         "Power Usage (W)",
+    "system_memory": "System Memory (GB)",
+}
 # Gauge colour attribute ↔ state key.
 COLOR_ATTRS = [("normal_color", "normal"), ("warn_color", "warn"), ("crit_color", "crit")]
 
@@ -55,6 +63,9 @@ class GPUMonitorApp(QMainWindow):
 
     # Emitted from the GUI thread to ask the worker (on its own thread) to fetch.
     _fetch_requested = Signal()
+    # Emitted (possibly from paho's thread) when a metric arrives over MQTT in
+    # remote mode; a queued connection marshals it to the GUI thread (FUN-15).
+    _subscribed_metric = Signal(str, object)
 
     def __init__(self):
         super().__init__()
@@ -67,7 +78,12 @@ class GPUMonitorApp(QMainWindow):
         self._thresholds_pct = self._state.get("thresholds",   DEFAULT_THRESHOLDS)
         self._gauge_colors   = self._state.get("gauge_colors", DEFAULT_GAUGE_COLORS)
         self._gauge_size     = self._state.get("gauge_size",   "normal")
-        self._mqtt_cfg       = self._state.get("mqtt",         DEFAULT_MQTT)
+        self._mqtt_cfg       = self._state.get("mqtt",          DEFAULT_MQTT)
+        self._mqtt_sub_cfg   = self._state.get("mqtt_subscribe", DEFAULT_MQTT_SUBSCRIBE)
+        self._subscribe_mode = bool(self._mqtt_sub_cfg.get("enabled", False))
+        # Remote machine's total RAM (GB), learned from MQTT in subscribe mode so
+        # the memory gauge can be scaled to the remote full-scale (FUN-15).
+        self._remote_mem_total = None
         self.current_layout  = layout
 
         self._total_memory_gb = None
@@ -117,7 +133,20 @@ class GPUMonitorApp(QMainWindow):
         # MQTT publisher (opt-in; inert unless enabled in config) (FUN-14).
         self._mqtt = MqttPublisher(**self._mqtt_cfg)
 
-        self._check_dependencies()
+        # MQTT subscriber for remote monitoring (opt-in; mutually exclusive with
+        # publishing) (FUN-15). Incoming messages arrive on paho's thread; the
+        # queued signal marshals each update onto the GUI thread.
+        self._subscribed_metric.connect(self._on_subscribed_metric)
+        self._mqtt_sub = MqttSubscriber(**self._mqtt_sub_cfg,
+                                        on_metric=self._subscribed_metric.emit)
+
+        if self._subscribe_mode:
+            # Remote mode: no local GPU/nvidia-smi needed. Blank the gauges until
+            # the first values arrive over MQTT.
+            for g in self._all_gauges():
+                g.show_na()
+        else:
+            self._check_dependencies()
         self.update_gauges()
 
     # ── Dependency check (SYS-03, SYS-04) ────────────────────────────────────
@@ -219,13 +248,74 @@ class GPUMonitorApp(QMainWindow):
         The worker emits ``finished`` when the blocking nvidia-smi call returns;
         ``_on_metrics`` applies the UI update on the GUI thread and only then
         schedules the next cycle, so at most one fetch is ever in flight (NFR-01).
+
+        In remote mode (FUN-15) local polling is suspended — the gauges are
+        driven by incoming MQTT messages instead — so this is a no-op.
         """
+        if self._subscribe_mode:
+            return
         self._fetch_requested.emit()
 
     @Slot(object, object)
     def _on_metrics(self, gpu_stats, mem_stats):
+        # Ignore a local fetch result that lands after switching to remote mode,
+        # and stop the loop (don't schedule the next cycle) (FUN-15).
+        if self._subscribe_mode:
+            return
         self._apply_metrics(gpu_stats, mem_stats)
         QTimer.singleShot(self.update_interval_ms, self.update_gauges)
+
+    @Slot(str, object)
+    def _on_subscribed_metric(self, key, value):
+        """
+        Apply a metric received over MQTT in remote mode (FUN-15).
+
+        Runs on the GUI thread (delivered via a queued signal). Logs threshold
+        breaches just like the local path (FUN-08).
+        """
+        # Total RAM is metadata, not a gauge: rescale the memory gauge to the
+        # remote machine's full-scale rather than this machine's.
+        if key == SYSTEM_MEMORY_TOTAL_KEY:
+            if value is not None and value > 0:
+                self._apply_remote_mem_total(value)
+            return
+
+        g = self._gauge_map().get(key)
+        if g is None:
+            return
+        if value is None:
+            g.show_na()
+            return
+        if key == "system_memory":
+            g.update_value(value, self._remote_mem_subtitle(value))
+        else:
+            g.update_value(value)
+        if g.state in ("warning", "critical"):
+            log_threshold_breach(LOG_LABELS[key], value, g.state)
+
+    def _remote_mem_subtitle(self, used: float) -> str:
+        """Subtitle for the memory gauge in remote mode, with total if known."""
+        total = self._remote_mem_total
+        if total:
+            return f"{used:.1f} GB / {total:.1f} GB ({used / total * 100:.0f}%)"
+        return f"{used:.1f} GB"
+
+    def _apply_remote_mem_total(self, total: float):
+        """
+        Rescale the memory gauge to a remote machine's total RAM (FUN-15).
+
+        Updates the full-scale and recomputes the absolute warn/crit thresholds
+        from the stored percentages so colouring stays correct on the new scale.
+        """
+        self._remote_mem_total = total
+        self._metric_ranges["system_memory"] = (0, total)
+        g = self.gauge_sys_mem
+        g.max_val = total
+        pct = self._thresholds_pct["system_memory"]
+        g.warn_threshold = pct_to_abs("system_memory", pct["warn"], self._metric_ranges)
+        g.crit_threshold = pct_to_abs("system_memory", pct["crit"], self._metric_ranges)
+        # Redraw at the new scale; keep the existing subtitle by recomputing it.
+        g.update_value(g.value, self._remote_mem_subtitle(g.value))
 
     def _apply_metrics(self, gpu_stats, mem_stats):
         """
@@ -267,12 +357,15 @@ class GPUMonitorApp(QMainWindow):
             self.gauge_sys_mem.show_na()
 
         # Publish the freshly-updated values to MQTT (FUN-14). No-op unless
-        # enabled; None (N/A) metrics are skipped by the publisher.
+        # enabled; None (N/A) metrics are skipped by the publisher. The total RAM
+        # is published too so a remote subscriber can scale its memory gauge to
+        # this machine's full-scale (FUN-15).
         self._mqtt.publish({
-            "temperature":   temp,
-            "utilization":   util,
-            "power":         power,
-            "system_memory": mem_used,
+            "temperature":         temp,
+            "utilization":         util,
+            "power":               power,
+            "system_memory":       mem_used,
+            "system_memory_total": mem_total,
         })
 
     # ── Layout switching ──────────────────────────────────────────────────────
@@ -305,6 +398,7 @@ class GPUMonitorApp(QMainWindow):
             thresholds=self._thresholds_pct,
             gauge_colors=self._collect_gauge_colors(),
             mqtt=self._mqtt_cfg,
+            mqtt_subscribe=self._mqtt_sub_cfg,
         )
 
         self._relayout(new_layout)
@@ -321,6 +415,7 @@ class GPUMonitorApp(QMainWindow):
             thresholds=self._thresholds_pct,
             gauge_colors=self._collect_gauge_colors(),
             mqtt=self._mqtt_cfg,
+            mqtt_subscribe=self._mqtt_sub_cfg,
         )
         w, h, x, y = parse_geometry(new_geo)
         self.setGeometry(x, y, w, h)
@@ -374,8 +469,10 @@ class GPUMonitorApp(QMainWindow):
             thresholds=self._thresholds_pct,
             gauge_colors=self._collect_gauge_colors(),
             mqtt=self._mqtt_cfg,
+            mqtt_subscribe=self._mqtt_sub_cfg,
         )
         self._mqtt.stop()
+        self._mqtt_sub.stop()
         self._thread.quit()
         self._thread.wait()
         event.accept()
@@ -514,6 +611,41 @@ class PreferencesDialog(QDialog):
         grid.addWidget(self.mqtt_topic, row, 1, 1, 4)
         row += 1
 
+        # ── MQTT subscribe / remote monitoring (FUN-15) ───────────────────────
+        grid.addWidget(self._header("MQTT Subscribe (Remote Monitoring)"), row, 0, 1, 5)
+        row += 1
+        self.mqtt_sub_enable = QCheckBox(
+            "Enable MQTT subscribe (read a remote machine; disables local polling & publishing)"
+        )
+        self.mqtt_sub_enable.setChecked(bool(app._mqtt_sub_cfg.get("enabled", False)))
+        grid.addWidget(self.mqtt_sub_enable, row, 0, 1, 5)
+        row += 1
+        grid.addWidget(QLabel("Broker host/IP:"), row, 0)
+        self.mqtt_sub_host = QLineEdit(str(app._mqtt_sub_cfg.get("host", "localhost")))
+        grid.addWidget(self.mqtt_sub_host, row, 1, 1, 4)
+        row += 1
+        grid.addWidget(QLabel("Port:"), row, 0)
+        self.mqtt_sub_port = QSpinBox()
+        self.mqtt_sub_port.setRange(1, 65535)
+        self.mqtt_sub_port.setValue(int(app._mqtt_sub_cfg.get("port", 1883)))
+        grid.addWidget(self.mqtt_sub_port, row, 1)
+        row += 1
+        grid.addWidget(QLabel("Machine name:"), row, 0)
+        self.mqtt_sub_machine = QLineEdit(str(app._mqtt_sub_cfg.get("machine", "")))
+        grid.addWidget(self.mqtt_sub_machine, row, 1, 1, 4)
+        row += 1
+        grid.addWidget(QLabel("Base topic:"), row, 0)
+        self.mqtt_sub_topic = QLineEdit(str(app._mqtt_sub_cfg.get("base_topic", "gpu_monitor")))
+        grid.addWidget(self.mqtt_sub_topic, row, 1, 1, 4)
+        row += 1
+
+        # Publishing and subscribing are mutually exclusive (FUN-15): turning
+        # one on turns the other off. The `if on` guard avoids a feedback loop.
+        self.mqtt_enable.toggled.connect(
+            lambda on: self.mqtt_sub_enable.setChecked(False) if on else None)
+        self.mqtt_sub_enable.toggled.connect(
+            lambda on: self.mqtt_enable.setChecked(False) if on else None)
+
         # ── OK / Cancel ───────────────────────────────────────────────────────
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -613,15 +745,35 @@ class PreferencesDialog(QDialog):
             g.update_value(g.value)  # immediate redraw (FUN-11)
         app._thresholds_pct = parsed
 
-        # MQTT settings (FUN-14): collect, apply to the live publisher, persist.
+        # MQTT settings (FUN-14, FUN-15): collect, apply to the live publisher /
+        # subscriber, switch poll mode, persist. The dialog's mutual-exclusivity
+        # wiring guarantees at most one of publish/subscribe is enabled.
         new_mqtt = {
             "enabled":    self.mqtt_enable.isChecked(),
             "host":       self.mqtt_host.text().strip() or "localhost",
             "port":       self.mqtt_port.value(),
             "base_topic": self.mqtt_topic.text().strip() or "gpu_monitor",
         }
+        new_sub = {
+            "enabled":    self.mqtt_sub_enable.isChecked(),
+            "host":       self.mqtt_sub_host.text().strip() or "localhost",
+            "port":       self.mqtt_sub_port.value(),
+            "base_topic": self.mqtt_sub_topic.text().strip() or "gpu_monitor",
+            "machine":    self.mqtt_sub_machine.text().strip(),
+        }
         app._mqtt_cfg = new_mqtt
+        app._mqtt_sub_cfg = new_sub
         app._mqtt.update_config(**new_mqtt)
+        app._mqtt_sub.update_config(**new_sub)
+
+        # Switch between local polling and remote mode (FUN-15).
+        was_subscribe = app._subscribe_mode
+        app._subscribe_mode = new_sub["enabled"]
+        if was_subscribe and not app._subscribe_mode:
+            app.update_gauges()           # leaving remote mode → restart polling
+        elif not was_subscribe and app._subscribe_mode:
+            for g in app._all_gauges():   # entering remote mode → blank gauges
+                g.show_na()               # (running poll loop self-stops)
 
         save_window_state(
             app._current_geometry(), app.current_layout,
@@ -630,5 +782,6 @@ class PreferencesDialog(QDialog):
             thresholds=app._thresholds_pct,
             gauge_colors=app._collect_gauge_colors(),
             mqtt=new_mqtt,
+            mqtt_subscribe=new_sub,
         )
         self.accept()

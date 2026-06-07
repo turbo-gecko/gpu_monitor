@@ -112,13 +112,31 @@ class TestMqttPublisher(unittest.TestCase):
             self.assertEqual(qos, 0)
             self.assertTrue(retain)
 
+    def test_values_rounded_to_one_decimal(self):
+        fake = FakeClient()
+        with self._patch_client(fake):
+            pub = MqttPublisher(enabled=True, base_topic="t")
+            pub.publish({"temperature": 45.678, "utilization": 30})
+        payloads = {topic: payload for (topic, payload, _q, _r) in fake.published}
+        self.assertEqual(payloads["testhost/t/temperature"], "45.7")
+        self.assertEqual(payloads["testhost/t/utilization"], "30.0")
+
+    def test_publishes_total_ram_topic(self):
+        fake = FakeClient()
+        with self._patch_client(fake):
+            pub = MqttPublisher(enabled=True, base_topic="gpu_monitor")
+            pub.publish({"system_memory": 12.3, "system_memory_total": 64.0})
+        topics = {t for (t, _p, _q, _r) in fake.published}
+        self.assertIn("testhost/gpu_monitor/system_memory_total", topics)
+        self.assertIn("testhost/gpu_monitor/system_memory", topics)
+
     def test_none_metrics_are_skipped(self):
         fake = FakeClient()
         with self._patch_client(fake):
             pub = MqttPublisher(enabled=True, base_topic="t")
             pub.publish({"temperature": None, "utilization": 50, "power": None,
                          "system_memory": None})
-        self.assertEqual(fake.published, [("testhost/t/utilization", "50", 0, True)])
+        self.assertEqual(fake.published, [("testhost/t/utilization", "50.0", 0, True)])
 
     def test_publish_failure_is_swallowed(self):
         fake = FakeClient(raise_on_publish=True)
@@ -143,7 +161,7 @@ class TestMqttPublisher(unittest.TestCase):
         self.assertTrue(first.loop_stopped)
         self.assertTrue(first.disconnected)
         self.assertEqual(second.connected, ("b", 1884))
-        self.assertEqual(second.published, [("testhost/y/temperature", "1", 0, True)])
+        self.assertEqual(second.published, [("testhost/y/temperature", "1.0", 0, True)])
 
     def test_update_config_to_disabled_goes_inert(self):
         fake = FakeClient()
