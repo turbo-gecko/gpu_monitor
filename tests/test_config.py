@@ -24,6 +24,8 @@ from gpu_monitor.config import (
     _is_valid_color,
     _validate_thresholds,
     _validate_gauge_colors,
+    _is_valid_port,
+    _validate_mqtt,
     load_window_state,
     save_window_state,
     get_geometry_for_layout,
@@ -31,6 +33,7 @@ from gpu_monitor.config import (
     format_geometry,
     DEFAULT_THRESHOLDS,
     DEFAULT_GAUGE_COLORS,
+    DEFAULT_MQTT,
     DEFAULT_WINDOW_STATE,
     UPDATE_INTERVAL_MIN_S,
     UPDATE_INTERVAL_MAX_S,
@@ -289,6 +292,74 @@ class TestValidateGaugeColors(unittest.TestCase):
         self.assertEqual(result["temperature"], DEFAULT_GAUGE_COLORS["temperature"])
 
 
+class TestIsValidPort(unittest.TestCase):
+    """FUN-14 — MQTT port validation."""
+
+    def test_default_port(self):
+        self.assertTrue(_is_valid_port(1883))
+
+    def test_min_boundary(self):
+        self.assertTrue(_is_valid_port(1))
+
+    def test_max_boundary(self):
+        self.assertTrue(_is_valid_port(65535))
+
+    def test_zero(self):
+        self.assertFalse(_is_valid_port(0))
+
+    def test_above_max(self):
+        self.assertFalse(_is_valid_port(65536))
+
+    def test_bool_rejected(self):
+        # bool is a subclass of int but must not be accepted as a port.
+        self.assertFalse(_is_valid_port(True))
+
+    def test_none(self):
+        self.assertFalse(_is_valid_port(None))
+
+    def test_string(self):
+        self.assertFalse(_is_valid_port("1883"))
+
+
+class TestValidateMqtt(unittest.TestCase):
+    """FUN-14 — MQTT settings validation logic."""
+
+    def test_all_valid(self):
+        raw = {"enabled": True, "host": "broker.local", "port": 8883, "base_topic": "gpus"}
+        result = _validate_mqtt(raw)
+        self.assertEqual(result, {"enabled": True, "host": "broker.local",
+                                  "port": 8883, "base_topic": "gpus"})
+
+    def test_missing_returns_defaults(self):
+        self.assertEqual(_validate_mqtt({}), DEFAULT_MQTT)
+
+    def test_non_dict_returns_defaults(self):
+        self.assertEqual(_validate_mqtt("nope"), DEFAULT_MQTT)
+        self.assertEqual(_validate_mqtt(None), DEFAULT_MQTT)
+
+    def test_non_bool_enabled_falls_back(self):
+        result = _validate_mqtt({"enabled": "yes"})
+        self.assertEqual(result["enabled"], DEFAULT_MQTT["enabled"])
+
+    def test_empty_host_falls_back(self):
+        result = _validate_mqtt({"host": ""})
+        self.assertEqual(result["host"], DEFAULT_MQTT["host"])
+
+    def test_out_of_range_port_falls_back(self):
+        result = _validate_mqtt({"port": 70000})
+        self.assertEqual(result["port"], DEFAULT_MQTT["port"])
+
+    def test_empty_base_topic_falls_back(self):
+        result = _validate_mqtt({"base_topic": ""})
+        self.assertEqual(result["base_topic"], DEFAULT_MQTT["base_topic"])
+
+    def test_partial_overrides_only_valid_keys(self):
+        result = _validate_mqtt({"enabled": True, "port": "bad"})
+        self.assertTrue(result["enabled"])
+        self.assertEqual(result["port"], DEFAULT_MQTT["port"])
+        self.assertEqual(result["host"], DEFAULT_MQTT["host"])
+
+
 class TestLoadWindowState(unittest.TestCase):
     """FUN-09, FUN-12 — config file loading."""
 
@@ -370,6 +441,21 @@ class TestLoadWindowState(unittest.TestCase):
         result = load_window_state()
         self.assertEqual(result["update_interval_s"], 2)  # default, not clamped here
 
+    def test_mqtt_defaults_when_absent(self):
+        config_file = os.path.join(self.temp_dir.name, "config.json")
+        with open(config_file, "w") as f:
+            json.dump({"layout": "Horizontal"}, f)
+        result = load_window_state()
+        self.assertEqual(result["mqtt"], DEFAULT_MQTT)
+
+    def test_mqtt_valid_is_loaded(self):
+        config_file = os.path.join(self.temp_dir.name, "config.json")
+        mqtt = {"enabled": True, "host": "10.0.0.5", "port": 1884, "base_topic": "rig"}
+        with open(config_file, "w") as f:
+            json.dump({"layout": "Horizontal", "mqtt": mqtt}, f)
+        result = load_window_state()
+        self.assertEqual(result["mqtt"], mqtt)
+
 
 class TestSaveWindowState(unittest.TestCase):
     """FUN-09, FUN-12 — config file saving."""
@@ -407,6 +493,21 @@ class TestSaveWindowState(unittest.TestCase):
         self.assertEqual(saved["horizontal_geometry"], "1200x400+300+150")
         self.assertEqual(saved["update_interval_s"], 5)
         self.assertEqual(saved["gauge_size"], "small")
+
+    def test_mqtt_is_persisted(self):
+        mqtt = {"enabled": True, "host": "broker", "port": 1883, "base_topic": "gpu"}
+        save_window_state("900x320+100+50", "Horizontal", mqtt=mqtt)
+        config_file = os.path.join(self.temp_dir.name, "config.json")
+        with open(config_file, "r") as f:
+            saved = json.load(f)
+        self.assertEqual(saved["mqtt"], mqtt)
+
+    def test_mqtt_defaults_when_absent_on_first_save(self):
+        save_window_state("900x320+100+50", "Horizontal")
+        config_file = os.path.join(self.temp_dir.name, "config.json")
+        with open(config_file, "r") as f:
+            saved = json.load(f)
+        self.assertEqual(saved["mqtt"], DEFAULT_MQTT)
 
 
 class TestGetGeometryForLayout(unittest.TestCase):

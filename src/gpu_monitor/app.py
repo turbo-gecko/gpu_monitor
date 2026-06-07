@@ -1,18 +1,19 @@
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QActionGroup, QColor, QKeySequence
 from PySide6.QtWidgets import (
-    QButtonGroup, QColorDialog, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QGridLayout, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton,
-    QRadioButton, QSpinBox, QVBoxLayout, QWidget,
+    QButtonGroup, QCheckBox, QColorDialog, QDialog, QDialogButtonBox,
+    QDoubleSpinBox, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QMessageBox, QPushButton, QRadioButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from .config import (
     UPDATE_INTERVAL_MIN_S, UPDATE_INTERVAL_MAX_S,
-    DEFAULT_THRESHOLDS, DEFAULT_GAUGE_COLORS,
+    DEFAULT_THRESHOLDS, DEFAULT_GAUGE_COLORS, DEFAULT_MQTT,
     load_window_state, save_window_state, get_geometry_for_layout,
     parse_geometry, format_geometry,
 )
 from .metrics import MetricsFetcher
+from .mqtt_publisher import MqttPublisher
 from .scaling import pct_to_abs, resolve_ranges, DEFAULT_METRIC_RANGES
 from .ui_components import Gauge
 from .logger import log_threshold_breach
@@ -66,6 +67,7 @@ class GPUMonitorApp(QMainWindow):
         self._thresholds_pct = self._state.get("thresholds",   DEFAULT_THRESHOLDS)
         self._gauge_colors   = self._state.get("gauge_colors", DEFAULT_GAUGE_COLORS)
         self._gauge_size     = self._state.get("gauge_size",   "normal")
+        self._mqtt_cfg       = self._state.get("mqtt",         DEFAULT_MQTT)
         self.current_layout  = layout
 
         self._total_memory_gb = None
@@ -112,6 +114,9 @@ class GPUMonitorApp(QMainWindow):
         self._worker.finished.connect(self._on_metrics)
         self._thread.start()
 
+        # MQTT publisher (opt-in; inert unless enabled in config) (FUN-14).
+        self._mqtt = MqttPublisher(**self._mqtt_cfg)
+
         self._check_dependencies()
         self.update_gauges()
 
@@ -147,17 +152,16 @@ class GPUMonitorApp(QMainWindow):
     def _setup_menu(self):
         menubar = self.menuBar()
 
-        layout_menu = menubar.addMenu("Layout")
         self._layout_group = QActionGroup(self)
         self._layout_group.setExclusive(True)
 
-        act_h = layout_menu.addAction("Horizontal")
+        act_h = self.addAction("Horizontal")
         act_h.setCheckable(True)
         act_h.setShortcut(QKeySequence("Ctrl+H"))
         act_h.triggered.connect(self.set_horizontal_layout)
         self._layout_group.addAction(act_h)
 
-        act_v = layout_menu.addAction("Vertical")
+        act_v = self.addAction("Vertical")
         act_v.setCheckable(True)
         act_v.setShortcut(QKeySequence("Ctrl+V"))
         act_v.triggered.connect(self.set_vertical_layout)
@@ -165,9 +169,6 @@ class GPUMonitorApp(QMainWindow):
 
         (act_v if self.current_layout == "Vertical" else act_h).setChecked(True)
         self._act_horizontal, self._act_vertical = act_h, act_v
-
-        layout_menu.addSeparator()
-        layout_menu.addAction("Reset to Default", self.set_horizontal_layout)
 
         settings_menu = menubar.addMenu("Settings")
         settings_menu.addAction("Preferences…", self._show_settings)
@@ -265,6 +266,15 @@ class GPUMonitorApp(QMainWindow):
         else:
             self.gauge_sys_mem.show_na()
 
+        # Publish the freshly-updated values to MQTT (FUN-14). No-op unless
+        # enabled; None (N/A) metrics are skipped by the publisher.
+        self._mqtt.publish({
+            "temperature":   temp,
+            "utilization":   util,
+            "power":         power,
+            "system_memory": mem_used,
+        })
+
     # ── Layout switching ──────────────────────────────────────────────────────
 
     def _relayout(self, layout: str):
@@ -273,7 +283,7 @@ class GPUMonitorApp(QMainWindow):
         if layout == "Vertical":
             box = QVBoxLayout(container)
             box.setContentsMargins(20, 10, 20, 10)
-            box.setSpacing(10)
+            box.setSpacing(5)
         else:
             box = QHBoxLayout(container)
             box.setContentsMargins(10, 20, 10, 20)
@@ -294,6 +304,7 @@ class GPUMonitorApp(QMainWindow):
             gauge_size=self._gauge_size,
             thresholds=self._thresholds_pct,
             gauge_colors=self._collect_gauge_colors(),
+            mqtt=self._mqtt_cfg,
         )
 
         self._relayout(new_layout)
@@ -309,6 +320,7 @@ class GPUMonitorApp(QMainWindow):
             gauge_size=self._gauge_size,
             thresholds=self._thresholds_pct,
             gauge_colors=self._collect_gauge_colors(),
+            mqtt=self._mqtt_cfg,
         )
         w, h, x, y = parse_geometry(new_geo)
         self.setGeometry(x, y, w, h)
@@ -361,7 +373,9 @@ class GPUMonitorApp(QMainWindow):
             gauge_size=self._gauge_size,
             thresholds=self._thresholds_pct,
             gauge_colors=self._collect_gauge_colors(),
+            mqtt=self._mqtt_cfg,
         )
+        self._mqtt.stop()
         self._thread.quit()
         self._thread.wait()
         event.accept()
@@ -392,6 +406,19 @@ class PreferencesDialog(QDialog):
 
         grid = QGridLayout(self)
         row = 0
+
+        # ── Layout (FUN-09) ─────────────────────────────────────────────
+        grid.addWidget(self._header("Layout"), row, 0, 1, 5)
+        row += 1
+        self.layout_group = QButtonGroup(self)
+        self._rb_horizontal = QRadioButton("Horizontal")
+        self._rb_vertical   = QRadioButton("Vertical")
+        self.layout_group.addButton(self._rb_horizontal)
+        self.layout_group.addButton(self._rb_vertical)
+        (self._rb_vertical if app.current_layout == "Vertical" else self._rb_horizontal).setChecked(True)
+        grid.addWidget(self._rb_horizontal, row, 0)
+        grid.addWidget(self._rb_vertical, row, 1)
+        row += 1
 
         # ── Update interval (FUN-04) ──────────────────────────────────────────
         grid.addWidget(self._header("Update Interval"), row, 0, 1, 5)
@@ -465,6 +492,28 @@ class PreferencesDialog(QDialog):
                 grid.addWidget(btn, row, col)
             row += 1
 
+        # ── MQTT publishing (FUN-14) ──────────────────────────────────────────
+        grid.addWidget(self._header("MQTT Publishing"), row, 0, 1, 5)
+        row += 1
+        self.mqtt_enable = QCheckBox("Enable MQTT publishing")
+        self.mqtt_enable.setChecked(bool(app._mqtt_cfg.get("enabled", False)))
+        grid.addWidget(self.mqtt_enable, row, 0, 1, 5)
+        row += 1
+        grid.addWidget(QLabel("Host:"), row, 0)
+        self.mqtt_host = QLineEdit(str(app._mqtt_cfg.get("host", "localhost")))
+        grid.addWidget(self.mqtt_host, row, 1, 1, 4)
+        row += 1
+        grid.addWidget(QLabel("Port:"), row, 0)
+        self.mqtt_port = QSpinBox()
+        self.mqtt_port.setRange(1, 65535)
+        self.mqtt_port.setValue(int(app._mqtt_cfg.get("port", 1883)))
+        grid.addWidget(self.mqtt_port, row, 1)
+        row += 1
+        grid.addWidget(QLabel("Base topic:"), row, 0)
+        self.mqtt_topic = QLineEdit(str(app._mqtt_cfg.get("base_topic", "gpu_monitor")))
+        grid.addWidget(self.mqtt_topic, row, 1, 1, 4)
+        row += 1
+
         # ── OK / Cancel ───────────────────────────────────────────────────────
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -536,6 +585,11 @@ class PreferencesDialog(QDialog):
 
             parsed[key] = {"warn": warn_pct, "crit": crit_pct}
 
+        # Layout (FUN-09)
+        new_layout = "Vertical" if self._rb_vertical.isChecked() else "Horizontal"
+        if new_layout != app.current_layout:
+            app._switch_layout(new_layout)
+
         # Interval (FUN-04)
         chosen_s = self.interval_spin.value()
         app.update_interval_ms = chosen_s * 1000
@@ -559,11 +613,22 @@ class PreferencesDialog(QDialog):
             g.update_value(g.value)  # immediate redraw (FUN-11)
         app._thresholds_pct = parsed
 
+        # MQTT settings (FUN-14): collect, apply to the live publisher, persist.
+        new_mqtt = {
+            "enabled":    self.mqtt_enable.isChecked(),
+            "host":       self.mqtt_host.text().strip() or "localhost",
+            "port":       self.mqtt_port.value(),
+            "base_topic": self.mqtt_topic.text().strip() or "gpu_monitor",
+        }
+        app._mqtt_cfg = new_mqtt
+        app._mqtt.update_config(**new_mqtt)
+
         save_window_state(
             app._current_geometry(), app.current_layout,
             update_interval_s=chosen_s,
             gauge_size=app._gauge_size,
             thresholds=app._thresholds_pct,
             gauge_colors=app._collect_gauge_colors(),
+            mqtt=new_mqtt,
         )
         self.accept()

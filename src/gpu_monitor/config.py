@@ -36,6 +36,16 @@ DEFAULT_THRESHOLDS = {
     "system_memory": {"warn": 90, "crit": 98},
 }
 
+# ── MQTT publishing (FUN-14) ──────────────────────────────────────────────────
+# Opt-in: disabled by default so users without a broker are unaffected. Each
+# metric is published to "<base_topic>/<metric>" when enabled.
+DEFAULT_MQTT = {
+    "enabled":    False,
+    "host":       "localhost",
+    "port":       1883,
+    "base_topic": "gpu_monitor",
+}
+
 # ── App-chrome colours (not user-configurable) ────────────────────────────────
 COLORS = {
     "bg":             "#1e1e1e",
@@ -57,6 +67,7 @@ DEFAULT_WINDOW_STATE = {
     "gauge_size":          "normal",
     "thresholds":          DEFAULT_THRESHOLDS,
     "gauge_colors":        DEFAULT_GAUGE_COLORS,
+    "mqtt":                DEFAULT_MQTT,
 }
 
 
@@ -147,6 +158,29 @@ def _validate_gauge_colors(raw) -> dict:
     return result
 
 
+def _is_valid_port(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 65535
+
+
+def _validate_mqtt(raw) -> dict:
+    """Return validated MQTT settings, falling back per-key to defaults."""
+    result = dict(DEFAULT_MQTT)
+    if not isinstance(raw, dict):
+        return result
+    enabled = raw.get("enabled")
+    if isinstance(enabled, bool):
+        result["enabled"] = enabled
+    host = raw.get("host")
+    if isinstance(host, str) and len(host) > 0:
+        result["host"] = host
+    if _is_valid_port(raw.get("port")):
+        result["port"] = raw["port"]
+    base_topic = raw.get("base_topic")
+    if isinstance(base_topic, str) and len(base_topic) > 0:
+        result["base_topic"] = base_topic
+    return result
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def load_window_state() -> dict:
@@ -191,6 +225,9 @@ def load_window_state() -> dict:
     state["thresholds"]   = _validate_thresholds(raw.get("thresholds"))
     state["gauge_colors"] = _validate_gauge_colors(raw.get("gauge_colors"))
 
+    # MQTT publishing (per-key fallback handled inside helper)
+    state["mqtt"] = _validate_mqtt(raw.get("mqtt"))
+
     return state
 
 
@@ -201,6 +238,7 @@ def save_window_state(
     gauge_size: str = "normal",
     thresholds: dict | None = None,
     gauge_colors: dict | None = None,
+    mqtt: dict | None = None,
 ) -> None:
     """
     Persist all user-configurable settings to CONFIG_FILE (FUN-09, FUN-12).
@@ -238,6 +276,11 @@ def save_window_state(
         saved["gauge_colors"] = gauge_colors
     elif "gauge_colors" not in saved:
         saved["gauge_colors"] = DEFAULT_GAUGE_COLORS
+
+    if mqtt is not None:
+        saved["mqtt"] = mqtt
+    elif "mqtt" not in saved:
+        saved["mqtt"] = DEFAULT_MQTT
 
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
